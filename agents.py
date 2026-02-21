@@ -30,16 +30,34 @@ def _call_gemini(system_prompt, user_prompt):
     return resp.text
 
 
+def _call_gemini_stream(system_prompt, user_prompt, stream_cb=None):
+    """Call Gemini with streaming; calls stream_cb(chunk_text) for each chunk."""
+    if stream_cb is None:
+        return _call_gemini(system_prompt, user_prompt)
+    client = _get_client()
+    full_text = ""
+    for chunk in client.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=user_prompt,
+        config=genai.types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.3,
+        ),
+    ):
+        if chunk.text:
+            full_text += chunk.text
+            stream_cb(chunk.text)
+    return full_text
+
+
 def _extract_json(text):
     """Extract JSON object from LLM response text."""
-    # Try to find JSON block in markdown code fences
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-    # Try to find raw JSON object
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
@@ -73,9 +91,11 @@ Return ONLY valid JSON (no markdown fences) in this format:
 }"""
 
 
-def run_researcher(claim):
+def run_researcher(claim, stream_cb=None, log_cb=None):
     """Agent 1: Search the web and gather evidence for the claim."""
-    # First, ask Gemini to break the claim into sub-claims
+    if log_cb:
+        log_cb("Breaking claim into sub-claims...")
+
     breakdown_prompt = (
         "Break this claim into verifiable sub-claims (max 3). "
         "Return ONLY a JSON list of strings.\n\nClaim: " + claim
@@ -84,17 +104,21 @@ def run_researcher(claim):
         "You break claims into verifiable sub-claims. Return ONLY a JSON list of strings.",
         breakdown_prompt,
     )
-    # Parse sub-claims
     try:
         sub_claims = json.loads(re.search(r"\[.*\]", raw, re.DOTALL).group(0))
     except Exception:
         sub_claims = [claim]
 
-    # Search for each sub-claim
+    if log_cb:
+        log_cb("Found %d sub-claims" % len(sub_claims))
+
     all_results = []
     for sc in sub_claims:
+        if log_cb:
+            log_cb('Searching: "%s"...' % sc[:60])
         search_results = search_ddg(sc)
-        # Fetch text from top 3 URLs
+        if log_cb:
+            log_cb("Found %d results" % len(search_results))
         for r in search_results[:3]:
             if r.get("url"):
                 content = fetch_url_text(r["url"])
@@ -102,14 +126,16 @@ def run_researcher(claim):
                     r["fetched_content"] = content[:1500]
         all_results.append({"sub_claim": sc, "search_results": search_results})
 
-    # Ask Gemini to synthesize findings
+    if log_cb:
+        log_cb("Synthesizing findings...")
+
     synth_prompt = (
         "Claim: " + claim + "\n\n"
         "Sub-claims and search results:\n" +
         json.dumps(all_results, indent=2, default=str)[:12000] +
         "\n\nAnalyze these results and produce your findings JSON."
     )
-    response = _call_gemini(RESEARCHER_PROMPT, synth_prompt)
+    response = _call_gemini_stream(RESEARCHER_PROMPT, synth_prompt, stream_cb)
     result = _extract_json(response)
     if "sub_claims" not in result:
         result["sub_claims"] = sub_claims
@@ -146,9 +172,8 @@ Return ONLY valid JSON (no markdown fences):
 }"""
 
 
-def run_skeptic(researcher_output):
+def run_skeptic(researcher_output, stream_cb=None, log_cb=None):
     """Agent 2: Audit sources for credibility."""
-    # Pre-score all sources
     findings = researcher_output.get("findings", [])
     for finding in findings:
         for ev in finding.get("evidence", []):
@@ -157,6 +182,14 @@ def run_skeptic(researcher_output):
             ev["credibility_score"] = sc["score"]
             ev["credibility_tier"] = sc["tier"]
             ev["domain"] = sc["domain"]
+            if log_cb:
+                status = "ACCEPTED" if sc["score"] >= SOURCE_SCORE_THRESHOLD else "REJECTED"
+                log_cb("Scoring %s → %d/10 (Tier %s) — %s" % (
+                    sc["domain"][:30], sc["score"], sc["tier"], status
+                ))
+
+    if log_cb:
+        log_cb("Analyzing source quality...")
 
     prompt = (
         "Researcher's findings with credibility scores:\n" +
@@ -164,9 +197,8 @@ def run_skeptic(researcher_output):
         "\n\nAudit these sources. Reject anything with score < " +
         str(SOURCE_SCORE_THRESHOLD) + "."
     )
-    response = _call_gemini(SKEPTIC_PROMPT, prompt)
-    result = _extract_json(response)
-    return result
+    response = _call_gemini_stream(SKEPTIC_PROMPT, prompt, stream_cb)
+    return _extract_json(response)
 
 
 # ─── AGENT 3: THE ADVERSARY ─────────────────────────────────────────────
@@ -191,15 +223,18 @@ Return ONLY valid JSON (no markdown fences):
 }"""
 
 
-def run_adversary(claim, skeptic_output):
+def run_adversary(claim, skeptic_output, stream_cb=None, log_cb=None):
     """Agent 3: Argue against the claim, find weaknesses."""
+    if log_cb:
+        log_cb("Stress-testing evidence...")
+
     prompt = (
         "Original claim: " + claim + "\n\n"
         "Skeptic's audited findings:\n" +
         json.dumps(skeptic_output, indent=2, default=str)[:12000] +
         "\n\nNow tear this apart. Find every weakness."
     )
-    response = _call_gemini(ADVERSARY_PROMPT, prompt)
+    response = _call_gemini_stream(ADVERSARY_PROMPT, prompt, stream_cb)
     return _extract_json(response)
 
 
@@ -229,8 +264,11 @@ Return ONLY valid JSON (no markdown fences):
 }"""
 
 
-def run_judge(claim, adversary_output, skeptic_output):
+def run_judge(claim, adversary_output, skeptic_output, stream_cb=None, log_cb=None):
     """Agent 4: Deliver final verdict."""
+    if log_cb:
+        log_cb("Weighing all evidence...")
+
     prompt = (
         "Original claim: " + claim + "\n\n"
         "Audited sources (from Skeptic):\n" +
@@ -239,5 +277,5 @@ def run_judge(claim, adversary_output, skeptic_output):
         json.dumps(adversary_output, indent=2, default=str)[:6000] +
         "\n\nDeliver your verdict."
     )
-    response = _call_gemini(JUDGE_PROMPT, prompt)
+    response = _call_gemini_stream(JUDGE_PROMPT, prompt, stream_cb)
     return _extract_json(response)

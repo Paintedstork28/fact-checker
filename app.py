@@ -41,6 +41,13 @@ VERDICT_STYLES = {
     "FALSE": ("#ef4444", "x-circle"),
 }
 
+AGENT_CONFIG = {
+    "researcher": {"label": "The Researcher", "icon": ":material/search:"},
+    "skeptic": {"label": "The Skeptic", "icon": ":material/policy:"},
+    "adversary": {"label": "The Adversary", "icon": ":material/gavel:"},
+    "judge": {"label": "The Judge", "icon": ":material/balance:"},
+}
+
 
 def get_verdict_style(verdict):
     v = (verdict or "").upper().strip()
@@ -56,32 +63,67 @@ if claim:
     st.markdown("**Claim:** " + claim)
     st.divider()
 
-    # Progress area
-    progress_container = st.container()
-    agent_status = progress_container.empty()
-    progress_bar = progress_container.progress(0)
+    # Build status containers for each agent
+    agent_order = ["researcher", "skeptic", "adversary", "judge"]
+    containers = {}   # agent_name -> st.status widget
+    placeholders = {} # agent_name -> (log_placeholder, stream_placeholder)
+    handovers = {}    # agent_name -> st.empty for handover text
+    stream_buffers = {}  # agent_name -> accumulated stream text
 
-    agent_steps = {
-        "researcher": (0.15, "Researcher is searching the web..."),
-        "skeptic": (0.45, "Skeptic is auditing sources..."),
-        "adversary": (0.70, "Adversary is stress-testing evidence..."),
-        "judge": (0.90, "Judge is deliberating..."),
-    }
+    for name in agent_order:
+        cfg = AGENT_CONFIG[name]
+        containers[name] = st.status(cfg["label"], state="complete")
+        handovers[name] = st.empty()
 
-    def status_callback(agent, message):
-        step = agent_steps.get(agent)
-        if step:
-            progress_bar.progress(step[0])
-            agent_status.info(step[1])
+    current_agent = {"name": None}
+
+    def event_callback(agent, event, data=""):
+        cfg = AGENT_CONFIG.get(agent, {})
+
+        if event == "start":
+            current_agent["name"] = agent
+            stream_buffers[agent] = ""
+            # Re-create inner placeholders each time agent starts
+            status_widget = containers[agent]
+            status_widget.update(label=cfg.get("label", agent), state="running")
+            # Write log and stream placeholders inside the status
+            with status_widget:
+                placeholders[agent] = (st.empty(), st.empty())
+
+        elif event == "log":
+            if agent in placeholders:
+                # Append log line — use the log placeholder
+                placeholders[agent][0].markdown(
+                    "_" + str(data) + "_"
+                )
+
+        elif event == "stream":
+            if agent in placeholders:
+                stream_buffers[agent] = stream_buffers.get(agent, "") + str(data)
+                # Show accumulated stream in the stream placeholder
+                # Truncate display to last 2000 chars to keep UI responsive
+                display = stream_buffers[agent]
+                if len(display) > 2000:
+                    display = "..." + display[-2000:]
+                placeholders[agent][1].code(display, language=None)
+
+        elif event == "handover":
+            handovers[agent].markdown(
+                "  **→** " + str(data)
+            )
+
+        elif event == "done":
+            containers[agent].update(
+                label=cfg.get("label", agent),
+                state="complete",
+            )
 
     # Run pipeline
     try:
-        results = run_pipeline(claim, status_callback=status_callback)
-        progress_bar.progress(1.0)
-        agent_status.success("Fact-check complete!")
+        results = run_pipeline(claim, callback=event_callback)
         st.session_state.results = results
     except Exception as e:
-        agent_status.error("Error: " + str(e))
+        st.error("Error: " + str(e))
         st.stop()
 
 # ── Display results ──────────────────────────────────────────────────────
