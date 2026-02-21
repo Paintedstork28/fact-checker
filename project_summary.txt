@@ -1,0 +1,48 @@
+PROJECT SUMMARY: Fact Checker — Multi-Agent Verification Tool
+=============================================================
+
+1. PROJECT CONCEPT
+   A multi-agent fact-checking tool where 4 adversarial AI agents rigorously verify
+   user-submitted claims. Each agent has a distinct personality: Researcher (gathers info),
+   Skeptic (audits sources), Adversary (argues against), and Judge (delivers verdict).
+   Target audience: anyone wanting to verify news, claims, or statements.
+
+2. HOW IT WAS BUILT
+   - Frontend: Streamlit (chat-style UI with progress indicators)
+   - LLM: Google Gemini 2.5 Flash via google-genai SDK
+   - Search: DuckDuckGo via duckduckgo-search Python library
+   - Architecture: 4-agent pipeline with retry loop (Skeptic can send Researcher back)
+   - Each agent has a unique system prompt and structured JSON output format
+
+3. DATABASE STRUCTURE
+   No database. All processing is in-memory per session.
+
+4. DATA SOURCES
+   - DuckDuckGo search results (real-time web search)
+   - URL content fetching (extracts text from web pages)
+
+5. APIS & COSTS
+   - Gemini 2.5 Flash API — free (generous free tier)
+   - DuckDuckGo Search — free, no API key needed
+   - Total cost: $0
+
+6. DATA REFRESH
+   Real-time. Every claim triggers fresh web searches and LLM analysis.
+
+7. DEPLOYMENT
+   - Local: streamlit run app.py
+   - Production: Streamlit Cloud (connected to GitHub repo)
+
+8. WHAT IT CAN BE USED FOR
+   - Verify news headlines and viral claims
+   - Check political statements and statistics
+   - Research factual accuracy of articles
+   - Educational tool for understanding source credibility
+
+9. SUGGESTED NEXT STEPS
+   - Add claim history/bookmarking
+   - Export fact-check reports as PDF
+   - Add more source tiers and domain lists
+   - Implement caching for repeated claims
+   - Add support for image/video claim verification
+   - User feedback mechanism on verdict accuracy
