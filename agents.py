@@ -1,6 +1,7 @@
 """Four adversarial fact-checking agents powered by Gemini."""
 import json
 import re
+import time
 
 from google import genai
 from config import get_gemini_api_key, GEMINI_MODEL, SOURCE_SCORE_THRESHOLD
@@ -8,6 +9,8 @@ from search_tools import search_ddg, fetch_url_text
 from source_scorer import score_source
 
 _client = None
+_MAX_RETRIES = 5
+_BASE_DELAY = 10  # seconds — free tier resets in ~8s
 
 def _get_client():
     global _client
@@ -17,37 +20,55 @@ def _get_client():
 
 
 def _call_gemini(system_prompt, user_prompt):
-    """Call Gemini and return text response."""
+    """Call Gemini with automatic retry on rate limit."""
     client = _get_client()
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_prompt,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.3,
-        ),
-    )
-    return resp.text
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=user_prompt,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.3,
+                ),
+            )
+            return resp.text
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = _BASE_DELAY * (attempt + 1)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Gemini rate limit exceeded after %d retries" % _MAX_RETRIES)
 
 
 def _call_gemini_stream(system_prompt, user_prompt, stream_cb=None):
-    """Call Gemini with streaming; calls stream_cb(chunk_text) for each chunk."""
+    """Call Gemini with streaming and automatic retry on rate limit."""
     if stream_cb is None:
         return _call_gemini(system_prompt, user_prompt)
     client = _get_client()
-    full_text = ""
-    for chunk in client.models.generate_content_stream(
-        model=GEMINI_MODEL,
-        contents=user_prompt,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.3,
-        ),
-    ):
-        if chunk.text:
-            full_text += chunk.text
-            stream_cb(chunk.text)
-    return full_text
+    for attempt in range(_MAX_RETRIES):
+        try:
+            full_text = ""
+            for chunk in client.models.generate_content_stream(
+                model=GEMINI_MODEL,
+                contents=user_prompt,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.3,
+                ),
+            ):
+                if chunk.text:
+                    full_text += chunk.text
+                    stream_cb(chunk.text)
+            return full_text
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = _BASE_DELAY * (attempt + 1)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Gemini rate limit exceeded after %d retries" % _MAX_RETRIES)
 
 
 def _extract_json(text):
