@@ -9,8 +9,11 @@ from search_tools import search_ddg, fetch_url_text
 from source_scorer import score_source
 
 _client = None
-_MAX_RETRIES = 5
-_BASE_DELAY = 10  # seconds — free tier resets in ~8s
+_MAX_RETRIES = 3
+_BASE_DELAY = 12  # seconds — free tier allows 5 req/min
+_PACE_DELAY = 15  # seconds between calls to stay within rate limit
+_last_call_time = 0
+
 
 def _get_client():
     global _client
@@ -19,8 +22,19 @@ def _get_client():
     return _client
 
 
+def _pace():
+    """Wait if needed to stay within Gemini free-tier rate limits."""
+    global _last_call_time
+    now = time.time()
+    elapsed = now - _last_call_time
+    if _last_call_time > 0 and elapsed < _PACE_DELAY:
+        time.sleep(_PACE_DELAY - elapsed)
+    _last_call_time = time.time()
+
+
 def _call_gemini(system_prompt, user_prompt):
-    """Call Gemini with automatic retry on rate limit."""
+    """Call Gemini with pacing and retry on rate limit."""
+    _pace()
     client = _get_client()
     for attempt in range(_MAX_RETRIES):
         try:
@@ -35,17 +49,17 @@ def _call_gemini(system_prompt, user_prompt):
             return resp.text
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = _BASE_DELAY * (attempt + 1)
-                time.sleep(wait)
+                time.sleep(_BASE_DELAY * (attempt + 1))
             else:
                 raise
     raise RuntimeError("Gemini rate limit exceeded after %d retries" % _MAX_RETRIES)
 
 
 def _call_gemini_stream(system_prompt, user_prompt, stream_cb=None):
-    """Call Gemini with streaming and automatic retry on rate limit."""
+    """Call Gemini with streaming, pacing, and retry on rate limit."""
     if stream_cb is None:
         return _call_gemini(system_prompt, user_prompt)
+    _pace()
     client = _get_client()
     for attempt in range(_MAX_RETRIES):
         try:
@@ -64,8 +78,7 @@ def _call_gemini_stream(system_prompt, user_prompt, stream_cb=None):
             return full_text
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = _BASE_DELAY * (attempt + 1)
-                time.sleep(wait)
+                time.sleep(_BASE_DELAY * (attempt + 1))
             else:
                 raise
     raise RuntimeError("Gemini rate limit exceeded after %d retries" % _MAX_RETRIES)
@@ -94,7 +107,7 @@ RESEARCHER_PROMPT = """You are THE RESEARCHER — thorough, eager, and comprehen
 Your job is to find as much relevant information as possible about a claim.
 
 Steps:
-1. Break the claim into individual verifiable sub-claims.
+1. First, identify the verifiable sub-claims within the main claim (max 2).
 2. For each sub-claim, I will provide web search results. Analyze them carefully.
 3. Summarize key findings with source attribution.
 
@@ -113,53 +126,39 @@ Return ONLY valid JSON (no markdown fences) in this format:
 
 
 def run_researcher(claim, stream_cb=None, log_cb=None):
-    """Agent 1: Search the web and gather evidence for the claim."""
+    """Agent 1: Search the web and gather evidence. Single Gemini call."""
     if log_cb:
-        log_cb("Breaking claim into sub-claims...")
+        log_cb("Searching the web...")
 
-    breakdown_prompt = (
-        "Break this claim into verifiable sub-claims (max 3). "
-        "Return ONLY a JSON list of strings.\n\nClaim: " + claim
-    )
-    raw = _call_gemini(
-        "You break claims into verifiable sub-claims. Return ONLY a JSON list of strings.",
-        breakdown_prompt,
-    )
-    try:
-        sub_claims = json.loads(re.search(r"\[.*\]", raw, re.DOTALL).group(0))
-    except Exception:
-        sub_claims = [claim]
-
+    # Search directly with the claim + a variant — no separate sub-claim call
+    search_results = search_ddg(claim)
     if log_cb:
-        log_cb("Found %d sub-claims" % len(sub_claims))
+        log_cb("Found %d results" % len(search_results))
 
-    all_results = []
-    for sc in sub_claims:
-        if log_cb:
-            log_cb('Searching: "%s"...' % sc[:60])
-        search_results = search_ddg(sc)
-        if log_cb:
-            log_cb("Found %d results" % len(search_results))
-        for r in search_results[:3]:
-            if r.get("url"):
-                content = fetch_url_text(r["url"])
-                if content:
-                    r["fetched_content"] = content[:1500]
-        all_results.append({"sub_claim": sc, "search_results": search_results})
+    # Fetch text from top 3 URLs
+    for r in search_results[:3]:
+        if r.get("url"):
+            content = fetch_url_text(r["url"])
+            if content:
+                r["fetched_content"] = content[:1500]
+
+    all_results = [{"sub_claim": claim, "search_results": search_results}]
 
     if log_cb:
         log_cb("Synthesizing findings...")
 
+    # Single Gemini call: break into sub-claims AND synthesize (CALL 1 of 4)
     synth_prompt = (
         "Claim: " + claim + "\n\n"
-        "Sub-claims and search results:\n" +
+        "Web search results:\n" +
         json.dumps(all_results, indent=2, default=str)[:12000] +
-        "\n\nAnalyze these results and produce your findings JSON."
+        "\n\nFirst identify the verifiable sub-claims, then analyze "
+        "these results and produce your findings JSON."
     )
     response = _call_gemini_stream(RESEARCHER_PROMPT, synth_prompt, stream_cb)
     result = _extract_json(response)
     if "sub_claims" not in result:
-        result["sub_claims"] = sub_claims
+        result["sub_claims"] = [claim]
     return result
 
 
@@ -176,7 +175,6 @@ Steps:
 1. Review each source and its credibility score.
 2. REJECT any source with score < 5 and explain why.
 3. Flag contradictions between sources.
-4. If fewer than 2 credible sources remain for a sub-claim, note what additional research is needed.
 
 Return ONLY valid JSON (no markdown fences):
 {
@@ -185,16 +183,14 @@ Return ONLY valid JSON (no markdown fences):
       "sub_claim": "...",
       "accepted_sources": [{"url": "...", "title": "...", "score": 7, "snippet": "..."}],
       "rejected_sources": [{"url": "...", "reason": "..."}],
-      "contradictions": ["..."],
-      "needs_more_research": false,
-      "research_suggestions": ""
+      "contradictions": ["..."]
     }
   ]
 }"""
 
 
 def run_skeptic(researcher_output, stream_cb=None, log_cb=None):
-    """Agent 2: Audit sources for credibility."""
+    """Agent 2: Audit sources for credibility. Single Gemini call (CALL 2 of 4)."""
     findings = researcher_output.get("findings", [])
     for finding in findings:
         for ev in finding.get("evidence", []):
@@ -245,7 +241,7 @@ Return ONLY valid JSON (no markdown fences):
 
 
 def run_adversary(claim, skeptic_output, stream_cb=None, log_cb=None):
-    """Agent 3: Argue against the claim, find weaknesses."""
+    """Agent 3: Argue against the claim. Single Gemini call (CALL 3 of 4)."""
     if log_cb:
         log_cb("Stress-testing evidence...")
 
@@ -286,7 +282,7 @@ Return ONLY valid JSON (no markdown fences):
 
 
 def run_judge(claim, adversary_output, skeptic_output, stream_cb=None, log_cb=None):
-    """Agent 4: Deliver final verdict."""
+    """Agent 4: Deliver final verdict. Single Gemini call (CALL 4 of 4)."""
     if log_cb:
         log_cb("Weighing all evidence...")
 

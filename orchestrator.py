@@ -1,5 +1,8 @@
-"""Orchestrator: manages the 4-agent fact-checking pipeline."""
-from config import MAX_RESEARCHER_RETRIES
+"""Orchestrator: manages the 4-agent fact-checking pipeline.
+
+Designed for exactly 4 Gemini API calls, paced to stay within
+the free-tier limit of 5 requests per minute.
+"""
 from agents import run_researcher, run_skeptic, run_adversary, run_judge
 
 
@@ -26,15 +29,14 @@ def run_pipeline(claim, callback=None):
             emit(agent_name, "log", msg)
         return stream_cb, log_cb
 
-    results = {"claim": claim, "retries": 0}
+    results = {"claim": claim}
 
-    # ── Agent 1: Researcher ──
+    # ── Agent 1: Researcher (Gemini call 1 of 4) ──
     emit("researcher", "start")
     s_cb, l_cb = make_cbs("researcher")
     researcher_out = run_researcher(claim, stream_cb=s_cb, log_cb=l_cb)
     results["researcher"] = researcher_out
 
-    # Build handover summary
     n_sources = sum(
         len(f.get("evidence", []))
         for f in researcher_out.get("findings", [])
@@ -44,54 +46,20 @@ def run_pipeline(claim, callback=None):
     emit("researcher", "handover",
          "Passing %d sources across %d sub-claims to Skeptic" % (n_sources, n_subclaims))
 
-    # ── Agent 2: Skeptic (with retry loop) ──
-    retries = 0
-    skeptic_out = None
-    current_research = researcher_out
-
-    while retries <= MAX_RESEARCHER_RETRIES:
-        emit("skeptic", "start")
-        s_cb, l_cb = make_cbs("skeptic")
-        skeptic_out = run_skeptic(current_research, stream_cb=s_cb, log_cb=l_cb)
-
-        needs_retry = False
-        audited = skeptic_out.get("audited_findings", [])
-        for finding in audited:
-            if finding.get("needs_more_research", False):
-                needs_retry = True
-                break
-
-        if not needs_retry or retries >= MAX_RESEARCHER_RETRIES:
-            break
-
-        retries += 1
-        results["retries"] = retries
-        emit("skeptic", "done")
-        emit("skeptic", "handover",
-             "Sending Researcher back for better sources (retry %d/%d)" % (retries, MAX_RESEARCHER_RETRIES))
-
-        emit("researcher", "start")
-        s_cb, l_cb = make_cbs("researcher")
-        suggestions = []
-        for f in audited:
-            s = f.get("research_suggestions", "")
-            if s:
-                suggestions.append(s)
-        refined_claim = claim + ". Focus on: " + "; ".join(suggestions) if suggestions else claim
-        current_research = run_researcher(refined_claim, stream_cb=s_cb, log_cb=l_cb)
-        results["researcher"] = current_research
-        emit("researcher", "done")
-
+    # ── Agent 2: Skeptic (Gemini call 2 of 4) ──
+    emit("skeptic", "start")
+    s_cb, l_cb = make_cbs("skeptic")
+    skeptic_out = run_skeptic(researcher_out, stream_cb=s_cb, log_cb=l_cb)
     results["skeptic"] = skeptic_out
 
-    # Build skeptic handover summary
+    audited = skeptic_out.get("audited_findings", [])
     accepted = sum(len(f.get("accepted_sources", [])) for f in audited)
     rejected = sum(len(f.get("rejected_sources", [])) for f in audited)
     emit("skeptic", "done")
     emit("skeptic", "handover",
          "%d accepted, %d rejected → Adversary" % (accepted, rejected))
 
-    # ── Agent 3: Adversary ──
+    # ── Agent 3: Adversary (Gemini call 3 of 4) ──
     emit("adversary", "start")
     s_cb, l_cb = make_cbs("adversary")
     adversary_out = run_adversary(claim, skeptic_out, stream_cb=s_cb, log_cb=l_cb)
@@ -104,7 +72,7 @@ def run_pipeline(claim, callback=None):
     emit("adversary", "handover",
          "%d for, %d against, %d critiques → Judge" % (n_for, n_against, n_critiques))
 
-    # ── Agent 4: Judge ──
+    # ── Agent 4: Judge (Gemini call 4 of 4) ──
     emit("judge", "start")
     s_cb, l_cb = make_cbs("judge")
     judge_out = run_judge(claim, adversary_out, skeptic_out, stream_cb=s_cb, log_cb=l_cb)
